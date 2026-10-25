@@ -10,10 +10,11 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from urllib.parse import urlparse
+from dataclasses import dataclass, replace
+from urllib.parse import parse_qs, urljoin, urlsplit
 
-from .page import Page, line_of, snippet
+from .net import origin
+from .page import Page, line_of, order_of, snippet
 
 FAIL, WARN = "FAIL", "WARN"
 
@@ -178,13 +179,27 @@ SALES_BUTTON = re.compile(r"^(?:今すぐ)?(?:ご?購入(?:する|手続き|は�
 TOKUSHOHO = re.compile(r"特定商取引法|特商法")
 
 
+def _host_is(host: str, domain: str) -> bool:
+    domain = domain.lower().strip(".")
+    return host == domain or host.endswith("." + domain)
+
+
 def is_affiliate(href: str, rel: str, extra_hosts: tuple[str, ...] = ()) -> bool:
-    h = href.lower()
+    """広告リンクか。ドメインはホスト名の完全一致かサブドメインで判定する（パスやクエリに含まれるだけなら違う）。"""
     if "sponsored" in rel.lower():
         return True
-    if any(host in h for host in AFFILIATE_HOSTS + extra_hosts):
+    try:
+        u = urlsplit(href.strip())
+        host = (u.hostname or "").rstrip(".")
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if any(_host_is(host, d) for d in AFFILIATE_HOSTS + tuple(extra_hosts)):
         return True
-    return ("amazon.co.jp" in h or "amazon.com" in h) and re.search(r"[?&]tag=", h) is not None
+    if _host_is(host, "amazon.co.jp") or _host_is(host, "amazon.com"):
+        return any(v.strip() for v in parse_qs(u.query).get("tag", []))
+    return False
 
 
 def check_legal(page: Page, extra_hosts: tuple[str, ...] = ()) -> list[Finding]:
@@ -192,14 +207,15 @@ def check_legal(page: Page, extra_hosts: tuple[str, ...] = ()) -> list[Finding]:
     ads = [l for l in page.links if is_affiliate(l.href, l.attrs.get("rel", ""), extra_hosts)]
     if ads:
         first = ads[0]
-        labels = [t for t in page.texts if AD_LABEL.search(t.text)]
-        if not labels and not re.search(r'class="[^"]*\b(pr|ad|sponsored)\b', page.raw, re.I):
+        # 表記は画面に見える文字だけで判定する（class 名・コメント・スクリプトの中身は数えない）
+        label_orders = [order_of(t, m.start()) for m, t in _text_hits(page, AD_LABEL)]
+        if not label_orders:
             out.append(Finding("LG01", FAIL, page.name, first.line,
                                f"広告リンク {len(ads)} 件に「広告」「PR」の表記がない（ステマ規制）",
                                "ページ上部か広告リンクの直前に「広告」「PR」「プロモーションを含みます」と見える文字で書く。"
                                "2023年10月から景品表示法の指定告示で、広告であることが分かりにくい表示は不当表示になる",
                                first.href[:80]))
-        elif labels and labels[0].order > first.order:
+        elif min(label_orders) > first.order:
             out.append(Finding("LG01", WARN, page.name, first.line,
                                "「広告」「PR」の表記が最初の広告リンクより後ろにある",
                                "表記を最初の広告リンクより前（ページ上部や記事の冒頭）に移す。末尾だけだと見落とされやすい",
@@ -227,13 +243,30 @@ def check_legal(page: Page, extra_hosts: tuple[str, ...] = ()) -> list[Finding]:
         out.append(Finding("LG05", WARN, page.name, None, "入力欄のあるページに免責・前提の記載がない",
                            "結果の近くに1回だけ書く（例: 「〇年度の公式の料率で計算した目安です。正確な金額は公式サイトで確認してください」）"))
     for action, line in page.form_actions:
-        if action.startswith("http://"):
+        kind = _form_target(action.strip(), page.url)
+        if kind == "http":
             out.append(Finding("LG08", FAIL, page.name, line, f"フォームが暗号化されていない http へ送信: {action[:60]}",
                                "送信先を https にする"))
-        elif action.startswith("https://"):
+        elif kind == "external":
             out.append(Finding("LG08", WARN, page.name, line, f"フォームが外部へ送信: {action[:60]}",
                                "送る項目と送信先をページに書き、プライバシーポリシーに外部サービス名を載せる"))
     return out
+
+
+def _form_target(action: str, page_url: str | None) -> str | None:
+    """フォームの送信先の種類。"http"（暗号化なし）/ "external"（別オリジン）/ None（同じオリジン・相対・判定不能）。"""
+    low = action.lower()
+    if not low.startswith(("http://", "https://", "//")):
+        return None  # 相対パス（同じオリジン）や javascript: など
+    try:
+        same = bool(page_url) and origin(urljoin(page_url, action)) == origin(page_url)
+    except ValueError:
+        same = False
+    if low.startswith("http://"):
+        # ページ自体が http で同じオリジンなら、問題はフォームではなくページの配信方法なのでここでは出さない
+        return None if same and page_url.lower().startswith("http://") else "http"
+    # ページの URL が分からない（ディレクトリ指定で --base-url なし）ときは、ホスト名のある送信先を外部とみなす
+    return None if same else "external"
 
 
 def site_legal(pages: list[Page]) -> list[Finding]:
@@ -294,6 +327,82 @@ def check_secrets(name: str, raw: str, blocklist: list[str]) -> list[Finding]:
     return out
 
 
+def find_secret_values(raw: str) -> set[str]:
+    return {m.group(0) for _, pat, _ in SECRET_PATTERNS for m in pat.finditer(raw)}
+
+
+class Redactor:
+    """結果に出す文字列から、見つかった秘密情報とブロックリストの語を伏せる。
+
+    メッセージや抜粋は途中で切られる（見出しは 40 文字、抜粋は前後 18 文字）ので、
+    秘密情報は 8 文字以上の断片、ブロックリストの語は切れ目（文字列の端・「…」の隣）に残った 2 文字以上の断片も伏せる。
+    """
+    MASK = "[伏せ字]"
+    SECRET_GRAM = 8
+
+    def __init__(self, secrets: set[str], blocklist: list[str]):
+        self.secrets = [s for s in secrets if s]
+        self.words = [w.lower() for w in blocklist if w]
+
+    @staticmethod
+    def _lower(s: str) -> str:
+        return "".join(c.lower() if len(c.lower()) == 1 else c for c in s)  # 長さを変えずに小文字にする
+
+    @staticmethod
+    def _edges(s: str, term: str, min_len: int, spans: list) -> None:
+        for k in range(len(term) - 1, min_len - 1, -1):
+            head, tail = term[:k], term[-k:]
+            if s.endswith(head):
+                spans.append((len(s) - k, len(s)))
+            if s.startswith(tail):
+                spans.append((0, k))
+            i = s.find(head + "…")
+            while i >= 0:
+                spans.append((i, i + k))
+                i = s.find(head + "…", i + 1)
+            i = s.find("…" + tail)
+            while i >= 0:
+                spans.append((i + 1, i + 1 + k))
+                i = s.find("…" + tail, i + 1)
+
+    def apply(self, s: str) -> str:
+        if not s or not (self.secrets or self.words):
+            return s
+        spans: list[tuple[int, int]] = []
+        n = self.SECRET_GRAM
+        for v in self.secrets:
+            grams = {v[i:i + n] for i in range(len(v) - n + 1)}
+            spans += [(i, i + n) for i in range(len(s) - n + 1) if s[i:i + n] in grams]
+            self._edges(s, v, 4, spans)
+        low = self._lower(s)
+        for w in self.words:
+            i = low.find(w)
+            while i >= 0:
+                spans.append((i, i + len(w)))
+                i = low.find(w, i + 1)
+            if len(w) >= 3:
+                self._edges(low, w, 2, spans)
+        if not spans:
+            return s
+        out, pos = [], 0
+        for a, b in sorted(spans):
+            if a < pos:
+                if b > pos:
+                    pos = b
+                continue
+            out += [s[pos:a], self.MASK]
+            pos = b
+        merged = "".join(out) + s[pos:]
+        while self.MASK + self.MASK in merged:
+            merged = merged.replace(self.MASK + self.MASK, self.MASK)
+        return merged
+
+    def finding(self, f: Finding) -> Finding:
+        # SC01・SC03 のメッセージは作るときに伏せてある（先頭6文字・1文字目だけ）
+        message = f.message if f.rule in ("SC01", "SC03") else self.apply(f.message)
+        return replace(f, where=self.apply(f.where), message=message, evidence=self.apply(f.evidence))
+
+
 def check_forbidden_path(rel: str) -> list[Finding]:
     sev = FAIL if FORBIDDEN_FAIL.search(rel) else WARN if FORBIDDEN_WARN.search(rel) else None
     if sev:
@@ -328,6 +437,3 @@ def check_basic(page: Page, min_text: int = 400) -> list[Finding]:
                            f"中身を足す（{min_text} 文字が目安）か、まだ載せないなら <meta name=\"robots\" content=\"noindex\"> を付ける"))
     return out
 
-
-def same_host(base: str, url: str) -> bool:
-    return urlparse(url).netloc in ("", urlparse(base).netloc)

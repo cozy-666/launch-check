@@ -4,20 +4,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import urllib.request
 from collections import defaultdict
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 from . import __version__
+from .net import MAX_BYTES, PRIVATE_HINT, BlockedURL, CrossOrigin, check_url, fetch, origin
 from .page import Page, parse
-from .rules import (FAIL, WARN, Finding, check_ai, check_basic, check_css_file, check_forbidden_path, check_legal,
-                    check_qa, check_secrets, same_host, site_legal)
+from .rules import (FAIL, WARN, Finding, Redactor, check_ai, check_basic, check_css_file, check_forbidden_path,
+                    check_legal, check_qa, check_secrets, find_secret_values, site_legal)
 
 CATEGORIES = ("ai", "qa", "legal", "secret", "basic")
 TEXT_EXT = {".html", ".htm", ".js", ".mjs", ".cjs", ".json", ".txt", ".xml", ".map", ".css", ".md", ".csv", ".yml", ".yaml"}
-MAX_BYTES = 5 * 1024 * 1024
-UA = f"launch-check/{__version__} (pre-launch site check)"
 
 
 def load_blocklist(path: str | None) -> list[str]:
@@ -31,18 +29,9 @@ def load_blocklist(path: str | None) -> list[str]:
     return words
 
 
-def fetch(url: str, timeout: float = 20.0) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=timeout) as res:
-        body = res.read(MAX_BYTES)
-        charset = res.headers.get_content_charset() or "utf-8"
-    return body.decode(charset, errors="replace")
-
-
 def run_checks(pages: list[Page], css_files: list[tuple[str, str]], text_files: list[tuple[str, str]],
-               paths: list[str], args) -> list[Finding]:
+               paths: list[str], args, blocklist: list[str]) -> list[Finding]:
     cats = set(args.only.split(",")) if args.only else set(CATEGORIES)
-    blocklist = load_blocklist(args.blocklist)
     extra_hosts = tuple(args.affiliate_host or ())
     found: list[Finding] = []
     for page in pages:
@@ -68,7 +57,7 @@ def run_checks(pages: list[Page], css_files: list[tuple[str, str]], text_files: 
     return [f for f in found if f.rule not in ignore]
 
 
-def collect_dir(root: Path):
+def collect_dir(root: Path, base_url: str | None = None):
     pages, css_files, text_files, paths = [], [], [], []
     for p in sorted(root.rglob("*")):
         rel = p.relative_to(root).as_posix()
@@ -85,32 +74,53 @@ def collect_dir(root: Path):
         raw = p.read_text(encoding="utf-8", errors="replace")
         text_files.append((rel, raw))
         if p.suffix.lower() in (".html", ".htm"):
-            pages.append(parse(rel, raw))
+            page = parse(rel, raw)
+            if base_url:
+                page.url = urljoin(base_url, rel)
+            pages.append(page)
         elif p.suffix.lower() == ".css":
             css_files.append((rel, raw))
     return pages, css_files, text_files, sorted(set(paths))
 
 
-def collect_urls(urls: list[str]):
+def collect_urls(urls: list[str], allow_private: bool = False):
     pages, css_files, text_files, errors = [], [], [], []
     seen_assets: set[str] = set()
     for url in urls:
         try:
-            raw = fetch(url)
+            raw, final = fetch(url, allow_private)
+        except BlockedURL as e:
+            errors.append(Finding("BS00", FAIL, url, None, f"取得しない: {e}",
+                                  f"公開中の http(s) の URL を指定する。{PRIVATE_HINT}"))
+            continue
         except Exception as e:  # noqa: BLE001 - 失敗は一覧に出して続ける
             errors.append(Finding("BS00", FAIL, url, None, f"取得できない: {e}", "URL・公開設定・認証を確認する"))
             continue
         page = parse(url, raw)
+        page.url = final
         pages.append(page)
         text_files.append((url, raw))
+        page_origin = origin(final)
         assets = [(h, "css") for h in page.stylesheets[:5]] + [(s, "js") for s in page.script_srcs[:10]]
         for href, kind in assets:
-            full = urljoin(url, href)
-            if full in seen_assets or not same_host(url, full) or urlparse(full).scheme not in ("http", "https"):
+            try:  # 壊れた URL（http://[bad/ など）は報告して次へ
+                full = urljoin(final, href.strip())
+                same = origin(full) == page_origin  # CSS・JS はページと同じオリジンだけ取りに行く
+            except ValueError as e:
+                errors.append(Finding("BS00", WARN, url, None, f"{kind.upper()} の URL が読めない（{e}）",
+                                      "URL の書き間違い（括弧の閉じ忘れ・ポート番号など）を直す", href[:80]))
+                continue
+            if full in seen_assets or not same:
                 continue
             seen_assets.add(full)
             try:
-                body = fetch(full)
+                body, _ = fetch(full, allow_private, same_origin=page_origin)
+            except CrossOrigin:
+                continue
+            except BlockedURL as e:
+                errors.append(Finding("BS00", WARN, url, None, f"{kind.upper()} を取得しない: {e}",
+                                      "読み込む CSS・JS の URL を確認する", href[:80]))
+                continue
             except Exception:  # noqa: BLE001
                 continue
             text_files.append((full, body))
@@ -163,6 +173,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--strict", action="store_true", help="WARN も不合格にする")
     ap.add_argument("--json", action="store_true", help="結果を JSON で出す")
     ap.add_argument("--max-per-rule", type=int, default=20, help="同じルール・重さの表示件数の上限（0 で無制限、既定 20）")
+    ap.add_argument("--allow-private", action="store_true",
+                    help="URL 指定時に、私的・ループバック（127.0.0.1 など）・リンクローカルのアドレスへの接続を許す（手元のサーバーの検査用）")
+    ap.add_argument("--base-url", metavar="URL",
+                    help="ディレクトリ指定時の公開 URL（例: https://example.com/）。フォームの送信先が同じサイトかの判定に使う")
     ap.add_argument("--version", action="version", version=f"launch-check {__version__}")
     return ap
 
@@ -187,16 +201,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ブロックリストが見つからない: {args.blocklist}", file=sys.stderr)
         return 2
 
+    if args.base_url:
+        try:
+            check_url(args.base_url)
+        except BlockedURL as e:
+            print(f"--base-url に使えない URL: {e}", file=sys.stderr)
+            return 2
+    blocklist = load_blocklist(args.blocklist)
+
     if dirs:
         root = Path(dirs[0])
         if not root.is_dir():
             print(f"ディレクトリが見つからない: {root}", file=sys.stderr)
             return 2
-        pages, css_files, text_files, paths = collect_dir(root)
-        found = run_checks(pages, css_files, text_files, paths, args)
+        pages, css_files, text_files, paths = collect_dir(root, args.base_url)
+        found = run_checks(pages, css_files, text_files, paths, args, blocklist)
     else:
-        pages, css_files, text_files, errors = collect_urls(urls)
-        found = errors + run_checks(pages, css_files, text_files, [], args)
+        pages, css_files, text_files, errors = collect_urls(urls, args.allow_private)
+        found = errors + run_checks(pages, css_files, text_files, [], args, blocklist)
+
+    # どのルールの結果にも、見つかった秘密情報とブロックリストの語をそのまま出さない（テキストと JSON の両方）
+    secrets: set[str] = set()
+    for _, raw in text_files:
+        secrets |= find_secret_values(raw)
+    redactor = Redactor(secrets, blocklist)
+    found = [redactor.finding(f) for f in found]
 
     if not pages and not found:
         print("HTML が1つも見つからない。ビルド後の出力ディレクトリ（out/ dist/ build/ など）を指定してください。", file=sys.stderr)

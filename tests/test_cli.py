@@ -101,10 +101,11 @@ class UrlModeTest(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
+    # 127.0.0.1 はループバックなので、手元のサーバーを検査するときの --allow-private を付ける
     def test_urls_good_and_bad(self):
-        code, out, _ = run(f"{self.base}/good/", f"{self.base}/good/privacy/")
+        code, out, _ = run(f"{self.base}/good/", f"{self.base}/good/privacy/", "--allow-private")
         self.assertEqual(code, 0, out)
-        code, out, _ = run(f"{self.base}/bad/")
+        code, out, _ = run(f"{self.base}/bad/", "--allow-private")
         self.assertEqual(code, 1)
         self.assertIn("/bad/style.css:4", out)  # 同じホストの CSS も取りに行く
 
@@ -112,7 +113,7 @@ class UrlModeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             lst = Path(d) / "urls.txt"
             lst.write_text(f"# コメント\n{self.base}/good/\n{self.base}/missing/\n", encoding="utf-8")
-            code, out, _ = run("--urls", str(lst))
+            code, out, _ = run("--urls", str(lst), "--allow-private")
             self.assertEqual(code, 1)
             self.assertIn("BS00", out)
 
