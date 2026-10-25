@@ -1,0 +1,16 @@
+{
+  "name": "launch-check",
+  "description": "日本語サイトの公開前チェック用プラグイン",
+  "owner": {
+    "name": "cozy-666"
+  },
+  "plugins": [
+    {
+      "name": "launch-check",
+      "source": "./",
+      "description": "日本語サイト・ツールの公開前チェック（AIっぽさ・広告表示と断定表現・秘密情報＋3つのレビュー担当）",
+      "category": "quality",
+      "tags": ["japanese", "review", "seo", "qa"]
+    }
+  ]
+}

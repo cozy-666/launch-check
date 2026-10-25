@@ -1,0 +1,3 @@
+:root { --main: #0f766e; --text: #1f2937; }
+body { color: var(--text); background: #fff; }
+.hero { background: linear-gradient(180deg, #f0fdfa, #fff); }
