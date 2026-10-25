@@ -107,7 +107,7 @@ class _Parser(HTMLParser):
         self.p.texts.append(Text(text, run[0][1], order, segments))
 
     def _pop(self):
-        _, hides = self.stack.pop()
+        _, hides, _block = self.stack.pop()
         if hides:
             self.css_hidden -= 1
 
@@ -115,12 +115,21 @@ class _Parser(HTMLParser):
         if tag in IMPLIED_END:
             while self.stack and self.stack[-1][0] in IMPLIED_END[tag]:
                 self._pop()
-        if tag in P_CLOSERS and self.stack and self.stack[-1][0] == "p":
-            self._pop()
+        if tag in P_CLOSERS:
+            # A block start closes an open <p> even through inline descendants (<p hidden><span>x<div>…).
+            for i in range(len(self.stack) - 1, -1, -1):
+                t = self.stack[i][0]
+                if t == "p":
+                    while len(self.stack) > i:
+                        self._pop()
+                    break
+                if t not in INLINE_TAGS:
+                    break
         if tag in VOID_TAGS:
             return
         hides = "hidden" in a or bool(HIDE_STYLE.search(a.get("style", "")))
-        self.stack.append((tag, hides))
+        block = tag not in INLINE_TAGS or bool(BLOCK_STYLE.search(a.get("style", "")))
+        self.stack.append((tag, hides, block))
         if hides:
             self.css_hidden += 1
 
@@ -175,7 +184,9 @@ class _Parser(HTMLParser):
             self.handle_endtag(tag)
 
     def handle_endtag(self, tag):
-        if tag not in INLINE_TAGS:
+        # An inline tag styled as a block (style="display:block") also ends a text run when it closes.
+        open_block = next((e[2] for e in reversed(self.stack) if e[0] == tag), False)
+        if tag not in INLINE_TAGS or open_block:
             self._flush()
         self.after_inline_end = tag in INLINE_TAGS
         for i in range(len(self.stack) - 1, -1, -1):

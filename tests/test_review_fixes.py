@@ -391,3 +391,18 @@ class P2_8_FormOriginTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodexRereviewTest(unittest.TestCase):
+    """2026-10-25 Codex re-review (P2): block-styled inline end and implicit <p> close through inline children."""
+
+    def test_block_styled_span_end_splits_text(self):
+        from launchcheck.page import parse
+        from launchcheck.rules import check_qa
+        page = parse("x.html", '<p><span style="display:block">Na</span>N</p>')
+        self.assertEqual([f.rule for f in check_qa(page)], [])
+
+    def test_hidden_p_closed_by_div_through_span(self):
+        from launchcheck.page import parse
+        page = parse("x.html", "<p hidden><span>x<div>TODO</div>")
+        self.assertIn("TODO", [x.text for x in page.texts])

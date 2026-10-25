@@ -126,14 +126,11 @@ sample-corp.example
 ```text
 $ python3 scripts/launch_check.py <サイトの out ディレクトリ>
 （ブロックリスト未指定: 社名・本名などの混入は検査していない。--blocklist で指定できる）
-WARN [BS04] 404.html  <html lang> がない
-      直し方: <html lang="ja"> を付ける（読み上げ・翻訳・検索が言語を判断する）
-WARN [BS04] 404/index.html  <html lang> がない
-      直し方: <html lang="ja"> を付ける（読み上げ・翻訳・検索が言語を判断する）
 
-launch-check: 通過（134 ページ / FAIL 0 件 / WARN 2 件）
-内訳: BS04 WARN 2
+launch-check: 通過（134 ページ / FAIL 0 件 / WARN 0 件）
 ```
+
+最初に流したときは、Next.js が出す404ページ2つに `<html lang>` がない（BS04 の WARN 2件）と出ました。ビルド後に lang を足す処理を入れて直したあとの結果が上です。
 
 所要時間は約1秒でした。この試運転で、次の2つの誤検知を見つけて直しています。
 
